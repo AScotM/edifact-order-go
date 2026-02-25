@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -63,12 +64,16 @@ const (
 	
 	FilePerms = 0644
 	DirPerms = 0755
+	MaxSegmentLength = 1000
 )
 
 var (
 	ErrInvalidOrder = errors.New("invalid order data")
 	ErrMissingField = errors.New("required field missing")
 	ErrFileWrite = errors.New("failed to write file")
+	ErrInvalidSeparator = errors.New("invalid separator character")
+	ErrSegmentTooLong = errors.New("segment exceeds maximum length")
+	ErrContextCancelled = errors.New("context cancelled")
 )
 
 type ValidationError struct {
@@ -85,8 +90,22 @@ type EDISegment struct {
 	Elements []string
 }
 
-func (s EDISegment) String(separator string, terminator string) string {
-	return s.Tag + separator + strings.Join(s.Elements, separator) + terminator
+func (s EDISegment) String(separator string, terminator string, releaseChar string) (string, error) {
+	var escapedElements []string
+	for _, elem := range s.Elements {
+		escaped := strings.ReplaceAll(elem, separator, releaseChar+separator)
+		escaped = strings.ReplaceAll(escaped, terminator, releaseChar+terminator)
+		escaped = strings.ReplaceAll(escaped, releaseChar, releaseChar+releaseChar)
+		escapedElements = append(escapedElements, escaped)
+	}
+	
+	result := s.Tag + separator + strings.Join(escapedElements, separator) + terminator
+	
+	if len(result) > MaxSegmentLength {
+		return "", ErrSegmentTooLong
+	}
+	
+	return result, nil
 }
 
 type Address struct {
@@ -102,6 +121,11 @@ func (a Address) Validate() error {
 	}
 	if len(a.Lines) == 0 {
 		return &ValidationError{Field: "Address.Lines", Message: "at least one address line is required"}
+	}
+	for i, line := range a.Lines {
+		if len(line) > 35 {
+			return &ValidationError{Field: fmt.Sprintf("Address.Lines[%d]", i), Message: "address line exceeds 35 characters"}
+		}
 	}
 	return nil
 }
@@ -125,6 +149,9 @@ func (i EDIOrderItem) Validate() error {
 	}
 	if i.BuyerItemCode == "" {
 		return &ValidationError{Field: "EDIOrderItem.BuyerItemCode", Message: "buyer item code is required"}
+	}
+	if len(i.BuyerItemCode) > 35 {
+		return &ValidationError{Field: "EDIOrderItem.BuyerItemCode", Message: "buyer item code exceeds 35 characters"}
 	}
 	if i.Quantity <= 0 {
 		return &ValidationError{Field: "EDIOrderItem.Quantity", Message: "quantity must be positive"}
@@ -173,8 +200,14 @@ func (o EDIOrder) Validate() error {
 	if o.InterchangeSenderID == "" {
 		return &ValidationError{Field: "EDIOrder.InterchangeSenderID", Message: "interchange sender ID is required"}
 	}
+	if len(o.InterchangeSenderID) > 35 {
+		return &ValidationError{Field: "EDIOrder.InterchangeSenderID", Message: "interchange sender ID exceeds 35 characters"}
+	}
 	if o.InterchangeReceiverID == "" {
 		return &ValidationError{Field: "EDIOrder.InterchangeReceiverID", Message: "interchange receiver ID is required"}
+	}
+	if len(o.InterchangeReceiverID) > 35 {
+		return &ValidationError{Field: "EDIOrder.InterchangeReceiverID", Message: "interchange receiver ID exceeds 35 characters"}
 	}
 	if o.InterchangeControlRef == "" {
 		return &ValidationError{Field: "EDIOrder.InterchangeControlRef", Message: "interchange control reference is required"}
@@ -184,6 +217,9 @@ func (o EDIOrder) Validate() error {
 	}
 	if o.OrderNumber == "" {
 		return &ValidationError{Field: "EDIOrder.OrderNumber", Message: "order number is required"}
+	}
+	if len(o.OrderNumber) > 35 {
+		return &ValidationError{Field: "EDIOrder.OrderNumber", Message: "order number exceeds 35 characters"}
 	}
 	if o.OrderDate.IsZero() {
 		return &ValidationError{Field: "EDIOrder.OrderDate", Message: "order date is required"}
@@ -202,6 +238,9 @@ func (o EDIOrder) Validate() error {
 	if len(o.Items) == 0 {
 		return &ValidationError{Field: "EDIOrder.Items", Message: "at least one item is required"}
 	}
+	if len(o.Items) > 999999 {
+		return &ValidationError{Field: "EDIOrder.Items", Message: "too many items"}
+	}
 	for i, item := range o.Items {
 		if err := item.Validate(); err != nil {
 			return fmt.Errorf("item at index %d validation failed: %w", i, err)
@@ -214,285 +253,444 @@ func (o EDIOrder) Validate() error {
 }
 
 type SegmentBuilder interface {
-	BuildUNB(order EDIOrder) (EDISegment, error)
-	BuildUNH(order EDIOrder) (EDISegment, error)
-	BuildBGM(order EDIOrder) (EDISegment, error)
-	BuildDTM(date time.Time, qualifier string) (EDISegment, error)
-	BuildCUX(order EDIOrder) (EDISegment, error)
-	BuildNAD(partyQualifier string, address Address) (EDISegment, error)
-	BuildTOD(order EDIOrder) (EDISegment, error)
-	BuildPAT(order EDIOrder) (EDISegment, error)
-	BuildTDT(order EDIOrder) (EDISegment, error)
-	BuildLIN(item EDIOrderItem) (EDISegment, error)
-	BuildIMD(item EDIOrderItem) (EDISegment, error)
-	BuildQTY(item EDIOrderItem) (EDISegment, error)
-	BuildPRI(item EDIOrderItem) (EDISegment, error)
-	BuildMOA(item EDIOrderItem) (EDISegment, error)
-	BuildCNT(order EDIOrder) (EDISegment, error)
-	BuildMOATotal(order EDIOrder) (EDISegment, error)
-	BuildUNT(order EDIOrder, segmentCount int) (EDISegment, error)
-	BuildUNZ(order EDIOrder, messageCount int) (EDISegment, error)
+	BuildUNB(ctx context.Context, order EDIOrder) (EDISegment, error)
+	BuildUNH(ctx context.Context, order EDIOrder) (EDISegment, error)
+	BuildBGM(ctx context.Context, order EDIOrder) (EDISegment, error)
+	BuildDTM(ctx context.Context, date time.Time, qualifier string) (EDISegment, error)
+	BuildCUX(ctx context.Context, order EDIOrder) (EDISegment, error)
+	BuildNAD(ctx context.Context, partyQualifier string, address Address) (EDISegment, error)
+	BuildTOD(ctx context.Context, order EDIOrder) (EDISegment, error)
+	BuildPAT(ctx context.Context, order EDIOrder) (EDISegment, error)
+	BuildTDT(ctx context.Context, order EDIOrder) (EDISegment, error)
+	BuildLIN(ctx context.Context, item EDIOrderItem) (EDISegment, error)
+	BuildIMD(ctx context.Context, item EDIOrderItem) (EDISegment, error)
+	BuildQTY(ctx context.Context, item EDIOrderItem) (EDISegment, error)
+	BuildPRI(ctx context.Context, item EDIOrderItem) (EDISegment, error)
+	BuildMOA(ctx context.Context, item EDIOrderItem) (EDISegment, error)
+	BuildCNT(ctx context.Context, order EDIOrder) (EDISegment, error)
+	BuildMOATotal(ctx context.Context, order EDIOrder) (EDISegment, error)
+	BuildUNT(ctx context.Context, order EDIOrder, segmentCount int) (EDISegment, error)
+	BuildUNZ(ctx context.Context, order EDIOrder, messageCount int) (EDISegment, error)
 }
 
 type EDIFACTOrderGenerator struct {
-	mu                 sync.RWMutex
 	segmentTerminator  string
 	elementSeparator   string
 	componentSeparator string
 	decimalMark        string
 	releaseCharacter   string
 	segmentBuilder     SegmentBuilder
+	pool               sync.Pool
 }
 
 type DefaultSegmentBuilder struct {
 	generator *EDIFACTOrderGenerator
 }
 
-func NewEDIFACTOrderGenerator() *EDIFACTOrderGenerator {
+func NewEDIFACTOrderGenerator() (*EDIFACTOrderGenerator, error) {
 	g := &EDIFACTOrderGenerator{
 		segmentTerminator:  "'",
 		elementSeparator:   "+",
 		componentSeparator: ":",
 		decimalMark:        ".",
 		releaseCharacter:   "?",
+		pool: sync.Pool{
+			New: func() interface{} {
+				return &strings.Builder{}
+			},
+		},
 	}
+	
+	if err := g.validateSeparators(); err != nil {
+		return nil, err
+	}
+	
 	g.segmentBuilder = &DefaultSegmentBuilder{generator: g}
-	return g
+	return g, nil
 }
 
-func (g *EDIFACTOrderGenerator) WithCustomSeparators(terminator, element, component, decimal, release string) *EDIFACTOrderGenerator {
-	g.mu.Lock()
-	defer g.mu.Unlock()
+func (g *EDIFACTOrderGenerator) validateSeparators() error {
+	chars := map[rune]bool{
+		rune(g.segmentTerminator[0]): true,
+		rune(g.elementSeparator[0]): true,
+		rune(g.componentSeparator[0]): true,
+		rune(g.releaseCharacter[0]): true,
+	}
+	
+	if len(chars) != 4 {
+		return ErrInvalidSeparator
+	}
+	
+	return nil
+}
+
+func (g *EDIFACTOrderGenerator) WithCustomSeparators(terminator, element, component, decimal, release string) (*EDIFACTOrderGenerator, error) {
 	g.segmentTerminator = terminator
 	g.elementSeparator = element
 	g.componentSeparator = component
 	g.decimalMark = decimal
 	g.releaseCharacter = release
-	return g
+	
+	if err := g.validateSeparators(); err != nil {
+		return nil, err
+	}
+	
+	return g, nil
 }
 
 func (g *EDIFACTOrderGenerator) WithSegmentBuilder(builder SegmentBuilder) *EDIFACTOrderGenerator {
-	g.mu.Lock()
-	defer g.mu.Unlock()
 	g.segmentBuilder = builder
 	return g
 }
 
-func (g *EDIFACTOrderGenerator) Generate(order EDIOrder) (string, error) {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
+func (g *EDIFACTOrderGenerator) Generate(ctx context.Context, order EDIOrder, writer io.Writer) error {
+	select {
+	case <-ctx.Done():
+		return ErrContextCancelled
+	default:
+	}
 	
 	if err := order.Validate(); err != nil {
-		return "", fmt.Errorf("order validation failed: %w", err)
+		return fmt.Errorf("order validation failed: %w", err)
 	}
 	
-	var segments []EDISegment
-	var err error
+	segmentCount := 0
+	foundUNH := false
 	
-	unb, err := g.segmentBuilder.BuildUNB(order)
+	unb, err := g.segmentBuilder.BuildUNB(ctx, order)
 	if err != nil {
-		return "", fmt.Errorf("failed to build UNB: %w", err)
+		return fmt.Errorf("failed to build UNB: %w", err)
 	}
-	segments = append(segments, unb)
 	
-	unh, err := g.segmentBuilder.BuildUNH(order)
-	if err != nil {
-		return "", fmt.Errorf("failed to build UNH: %w", err)
+	if err := g.writeSegment(unb, writer); err != nil {
+		return err
 	}
-	segments = append(segments, unh)
 	
-	bgm, err := g.segmentBuilder.BuildBGM(order)
+	unh, err := g.segmentBuilder.BuildUNH(ctx, order)
 	if err != nil {
-		return "", fmt.Errorf("failed to build BGM: %w", err)
+		return fmt.Errorf("failed to build UNH: %w", err)
 	}
-	segments = append(segments, bgm)
 	
-	dtm, err := g.segmentBuilder.BuildDTM(order.OrderDate, QualifierDocumentDate)
-	if err != nil {
-		return "", fmt.Errorf("failed to build DTM: %w", err)
+	if err := g.writeSegment(unh, writer); err != nil {
+		return err
 	}
-	segments = append(segments, dtm)
+	foundUNH = true
+	segmentCount = 1
+	
+	bgm, err := g.segmentBuilder.BuildBGM(ctx, order)
+	if err != nil {
+		return fmt.Errorf("failed to build BGM: %w", err)
+	}
+	
+	if err := g.writeSegment(bgm, writer); err != nil {
+		return err
+	}
+	if foundUNH {
+		segmentCount++
+	}
+	
+	dtm, err := g.segmentBuilder.BuildDTM(ctx, order.OrderDate, QualifierDocumentDate)
+	if err != nil {
+		return fmt.Errorf("failed to build DTM: %w", err)
+	}
+	
+	if err := g.writeSegment(dtm, writer); err != nil {
+		return err
+	}
+	if foundUNH {
+		segmentCount++
+	}
 	
 	if !order.DeliveryDate.IsZero() {
 		qualifier := QualifierDeliveryDate
 		if order.DeliveryDateQualifier != "" {
 			qualifier = order.DeliveryDateQualifier
 		}
-		deliveryDTM, err := g.segmentBuilder.BuildDTM(order.DeliveryDate, qualifier)
+		deliveryDTM, err := g.segmentBuilder.BuildDTM(ctx, order.DeliveryDate, qualifier)
 		if err != nil {
-			return "", fmt.Errorf("failed to build delivery DTM: %w", err)
+			return fmt.Errorf("failed to build delivery DTM: %w", err)
 		}
-		segments = append(segments, deliveryDTM)
+		
+		if err := g.writeSegment(deliveryDTM, writer); err != nil {
+			return err
+		}
+		if foundUNH {
+			segmentCount++
+		}
 	}
 	
 	if order.Currency != "" {
-		cux, err := g.segmentBuilder.BuildCUX(order)
+		cux, err := g.segmentBuilder.BuildCUX(ctx, order)
 		if err != nil {
-			return "", fmt.Errorf("failed to build CUX: %w", err)
+			return fmt.Errorf("failed to build CUX: %w", err)
 		}
-		segments = append(segments, cux)
+		
+		if err := g.writeSegment(cux, writer); err != nil {
+			return err
+		}
+		if foundUNH {
+			segmentCount++
+		}
 	}
 	
 	if order.Buyer.Name != "" {
-		buyerNAD, err := g.segmentBuilder.BuildNAD(PartyBuyer, order.Buyer)
+		buyerNAD, err := g.segmentBuilder.BuildNAD(ctx, PartyBuyer, order.Buyer)
 		if err != nil {
-			return "", fmt.Errorf("failed to build buyer NAD: %w", err)
+			return fmt.Errorf("failed to build buyer NAD: %w", err)
 		}
-		segments = append(segments, buyerNAD)
+		
+		if err := g.writeSegment(buyerNAD, writer); err != nil {
+			return err
+		}
+		if foundUNH {
+			segmentCount++
+		}
 	}
 	
 	if order.Seller.Name != "" {
-		sellerNAD, err := g.segmentBuilder.BuildNAD(PartySeller, order.Seller)
+		sellerNAD, err := g.segmentBuilder.BuildNAD(ctx, PartySeller, order.Seller)
 		if err != nil {
-			return "", fmt.Errorf("failed to build seller NAD: %w", err)
+			return fmt.Errorf("failed to build seller NAD: %w", err)
 		}
-		segments = append(segments, sellerNAD)
+		
+		if err := g.writeSegment(sellerNAD, writer); err != nil {
+			return err
+		}
+		if foundUNH {
+			segmentCount++
+		}
 	}
 	
 	if order.Delivery.Name != "" {
-		deliveryNAD, err := g.segmentBuilder.BuildNAD(PartyDelivery, order.Delivery)
+		deliveryNAD, err := g.segmentBuilder.BuildNAD(ctx, PartyDelivery, order.Delivery)
 		if err != nil {
-			return "", fmt.Errorf("failed to build delivery NAD: %w", err)
+			return fmt.Errorf("failed to build delivery NAD: %w", err)
 		}
-		segments = append(segments, deliveryNAD)
+		
+		if err := g.writeSegment(deliveryNAD, writer); err != nil {
+			return err
+		}
+		if foundUNH {
+			segmentCount++
+		}
 	}
 	
 	if order.Invoice.Name != "" {
-		invoiceNAD, err := g.segmentBuilder.BuildNAD(PartyInvoice, order.Invoice)
+		invoiceNAD, err := g.segmentBuilder.BuildNAD(ctx, PartyInvoice, order.Invoice)
 		if err != nil {
-			return "", fmt.Errorf("failed to build invoice NAD: %w", err)
+			return fmt.Errorf("failed to build invoice NAD: %w", err)
 		}
-		segments = append(segments, invoiceNAD)
+		
+		if err := g.writeSegment(invoiceNAD, writer); err != nil {
+			return err
+		}
+		if foundUNH {
+			segmentCount++
+		}
 	}
 	
 	if order.DeliveryTerms != "" || order.DeliveryTermsCode != "" {
-		tod, err := g.segmentBuilder.BuildTOD(order)
+		tod, err := g.segmentBuilder.BuildTOD(ctx, order)
 		if err != nil {
-			return "", fmt.Errorf("failed to build TOD: %w", err)
+			return fmt.Errorf("failed to build TOD: %w", err)
 		}
-		segments = append(segments, tod)
+		
+		if err := g.writeSegment(tod, writer); err != nil {
+			return err
+		}
+		if foundUNH {
+			segmentCount++
+		}
 	}
 	
 	if order.PaymentTerms != "" || order.PaymentTermsCode != "" {
-		pat, err := g.segmentBuilder.BuildPAT(order)
+		pat, err := g.segmentBuilder.BuildPAT(ctx, order)
 		if err != nil {
-			return "", fmt.Errorf("failed to build PAT: %w", err)
+			return fmt.Errorf("failed to build PAT: %w", err)
 		}
-		segments = append(segments, pat)
+		
+		if err := g.writeSegment(pat, writer); err != nil {
+			return err
+		}
+		if foundUNH {
+			segmentCount++
+		}
 	}
 	
 	if order.TransportMode != "" || order.TransportModeCode != "" {
-		tdt, err := g.segmentBuilder.BuildTDT(order)
+		tdt, err := g.segmentBuilder.BuildTDT(ctx, order)
 		if err != nil {
-			return "", fmt.Errorf("failed to build TDT: %w", err)
+			return fmt.Errorf("failed to build TDT: %w", err)
 		}
-		segments = append(segments, tdt)
+		
+		if err := g.writeSegment(tdt, writer); err != nil {
+			return err
+		}
+		if foundUNH {
+			segmentCount++
+		}
 	}
 	
 	for _, item := range order.Items {
-		lin, err := g.segmentBuilder.BuildLIN(item)
-		if err != nil {
-			return "", fmt.Errorf("failed to build LIN: %w", err)
+		select {
+		case <-ctx.Done():
+			return ErrContextCancelled
+		default:
 		}
-		segments = append(segments, lin)
 		
-		imd, err := g.segmentBuilder.BuildIMD(item)
+		lin, err := g.segmentBuilder.BuildLIN(ctx, item)
 		if err != nil {
-			return "", fmt.Errorf("failed to build IMD: %w", err)
+			return fmt.Errorf("failed to build LIN: %w", err)
 		}
-		segments = append(segments, imd)
 		
-		qty, err := g.segmentBuilder.BuildQTY(item)
-		if err != nil {
-			return "", fmt.Errorf("failed to build QTY: %w", err)
+		if err := g.writeSegment(lin, writer); err != nil {
+			return err
 		}
-		segments = append(segments, qty)
+		if foundUNH {
+			segmentCount++
+		}
 		
-		pri, err := g.segmentBuilder.BuildPRI(item)
+		imd, err := g.segmentBuilder.BuildIMD(ctx, item)
 		if err != nil {
-			return "", fmt.Errorf("failed to build PRI: %w", err)
+			return fmt.Errorf("failed to build IMD: %w", err)
 		}
-		segments = append(segments, pri)
 		
-		moa, err := g.segmentBuilder.BuildMOA(item)
-		if err != nil {
-			return "", fmt.Errorf("failed to build MOA: %w", err)
+		if err := g.writeSegment(imd, writer); err != nil {
+			return err
 		}
-		segments = append(segments, moa)
+		if foundUNH {
+			segmentCount++
+		}
+		
+		qty, err := g.segmentBuilder.BuildQTY(ctx, item)
+		if err != nil {
+			return fmt.Errorf("failed to build QTY: %w", err)
+		}
+		
+		if err := g.writeSegment(qty, writer); err != nil {
+			return err
+		}
+		if foundUNH {
+			segmentCount++
+		}
+		
+		pri, err := g.segmentBuilder.BuildPRI(ctx, item)
+		if err != nil {
+			return fmt.Errorf("failed to build PRI: %w", err)
+		}
+		
+		if err := g.writeSegment(pri, writer); err != nil {
+			return err
+		}
+		if foundUNH {
+			segmentCount++
+		}
+		
+		moa, err := g.segmentBuilder.BuildMOA(ctx, item)
+		if err != nil {
+			return fmt.Errorf("failed to build MOA: %w", err)
+		}
+		
+		if err := g.writeSegment(moa, writer); err != nil {
+			return err
+		}
+		if foundUNH {
+			segmentCount++
+		}
 		
 		if !item.DeliveryDate.IsZero() {
-			itemDTM, err := g.segmentBuilder.BuildDTM(item.DeliveryDate, QualifierLineDeliveryDate)
+			itemDTM, err := g.segmentBuilder.BuildDTM(ctx, item.DeliveryDate, QualifierLineDeliveryDate)
 			if err != nil {
-				return "", fmt.Errorf("failed to build item DTM: %w", err)
+				return fmt.Errorf("failed to build item DTM: %w", err)
 			}
-			segments = append(segments, itemDTM)
+			
+			if err := g.writeSegment(itemDTM, writer); err != nil {
+				return err
+			}
+			if foundUNH {
+				segmentCount++
+			}
 		}
 	}
 	
-	segments = append(segments, EDISegment{Tag: SegmentTagUNS, Elements: []string{"S"}})
+	uns := EDISegment{Tag: SegmentTagUNS, Elements: []string{"S"}}
+	if err := g.writeSegment(uns, writer); err != nil {
+		return err
+	}
+	if foundUNH {
+		segmentCount++
+	}
 	
-	cnt, err := g.segmentBuilder.BuildCNT(order)
+	cnt, err := g.segmentBuilder.BuildCNT(ctx, order)
 	if err != nil {
-		return "", fmt.Errorf("failed to build CNT: %w", err)
+		return fmt.Errorf("failed to build CNT: %w", err)
 	}
-	segments = append(segments, cnt)
 	
-	moaTotal, err := g.segmentBuilder.BuildMOATotal(order)
+	if err := g.writeSegment(cnt, writer); err != nil {
+		return err
+	}
+	if foundUNH {
+		segmentCount++
+	}
+	
+	moaTotal, err := g.segmentBuilder.BuildMOATotal(ctx, order)
 	if err != nil {
-		return "", fmt.Errorf("failed to build MOA total: %w", err)
+		return fmt.Errorf("failed to build MOA total: %w", err)
 	}
-	segments = append(segments, moaTotal)
 	
-	segmentCount := g.countSegmentsBetweenUNHAndUNT(segments)
-	unt, err := g.segmentBuilder.BuildUNT(order, segmentCount)
+	if err := g.writeSegment(moaTotal, writer); err != nil {
+		return err
+	}
+	if foundUNH {
+		segmentCount++
+	}
+	
+	unt, err := g.segmentBuilder.BuildUNT(ctx, order, segmentCount)
 	if err != nil {
-		return "", fmt.Errorf("failed to build UNT: %w", err)
+		return fmt.Errorf("failed to build UNT: %w", err)
 	}
-	segments = append(segments, unt)
 	
-	messageCount := g.countMessages(segments)
-	unz, err := g.segmentBuilder.BuildUNZ(order, messageCount)
+	if err := g.writeSegment(unt, writer); err != nil {
+		return err
+	}
+	
+	messageCount := 1
+	unz, err := g.segmentBuilder.BuildUNZ(ctx, order, messageCount)
 	if err != nil {
-		return "", fmt.Errorf("failed to build UNZ: %w", err)
-	}
-	segments = append(segments, unz)
-
-	var result strings.Builder
-	for _, seg := range segments {
-		result.WriteString(seg.String(g.elementSeparator, g.segmentTerminator))
-		result.WriteString("\n")
+		return fmt.Errorf("failed to build UNZ: %w", err)
 	}
 	
-	return result.String(), nil
+	if err := g.writeSegment(unz, writer); err != nil {
+		return err
+	}
+	
+	return nil
 }
 
-func (g *EDIFACTOrderGenerator) countSegmentsBetweenUNHAndUNT(segments []EDISegment) int {
-	count := 0
-	foundUNH := false
-	for _, seg := range segments {
-		if seg.Tag == SegmentTagUNH {
-			foundUNH = true
-			count = 1
-		} else if seg.Tag == SegmentTagUNT {
-			break
-		} else if foundUNH {
-			count++
-		}
+func (g *EDIFACTOrderGenerator) writeSegment(segment EDISegment, writer io.Writer) error {
+	builder := g.pool.Get().(*strings.Builder)
+	builder.Reset()
+	defer g.pool.Put(builder)
+	
+	str, err := segment.String(g.elementSeparator, g.segmentTerminator, g.releaseCharacter)
+	if err != nil {
+		return err
 	}
-	return count
+	
+	builder.WriteString(str)
+	builder.WriteString("\n")
+	
+	_, err = writer.Write([]byte(builder.String()))
+	return err
 }
 
-func (g *EDIFACTOrderGenerator) countMessages(segments []EDISegment) int {
-	count := 0
-	for _, seg := range segments {
-		if seg.Tag == SegmentTagUNH {
-			count++
-		}
+func (b *DefaultSegmentBuilder) BuildUNB(ctx context.Context, order EDIOrder) (EDISegment, error) {
+	select {
+	case <-ctx.Done():
+		return EDISegment{}, ErrContextCancelled
+	default:
 	}
-	return count
-}
-
-func (b *DefaultSegmentBuilder) BuildUNB(order EDIOrder) (EDISegment, error) {
+	
 	date := order.OrderDate.Format(DateFormatYYMMDD)
 	time := order.OrderDate.Format(DateFormatHHMM)
 	
@@ -526,7 +724,13 @@ func (b *DefaultSegmentBuilder) BuildUNB(order EDIOrder) (EDISegment, error) {
 	}, nil
 }
 
-func (b *DefaultSegmentBuilder) BuildUNH(order EDIOrder) (EDISegment, error) {
+func (b *DefaultSegmentBuilder) BuildUNH(ctx context.Context, order EDIOrder) (EDISegment, error) {
+	select {
+	case <-ctx.Done():
+		return EDISegment{}, ErrContextCancelled
+	default:
+	}
+	
 	messageVersion := "D"
 	messageRelease := "96A"
 	responsibleAgency := "UN"
@@ -554,7 +758,13 @@ func (b *DefaultSegmentBuilder) BuildUNH(order EDIOrder) (EDISegment, error) {
 	}, nil
 }
 
-func (b *DefaultSegmentBuilder) BuildBGM(order EDIOrder) (EDISegment, error) {
+func (b *DefaultSegmentBuilder) BuildBGM(ctx context.Context, order EDIOrder) (EDISegment, error) {
+	select {
+	case <-ctx.Done():
+		return EDISegment{}, ErrContextCancelled
+	default:
+	}
+	
 	return EDISegment{
 		Tag: SegmentTagBGM,
 		Elements: []string{
@@ -565,7 +775,13 @@ func (b *DefaultSegmentBuilder) BuildBGM(order EDIOrder) (EDISegment, error) {
 	}, nil
 }
 
-func (b *DefaultSegmentBuilder) BuildDTM(date time.Time, qualifier string) (EDISegment, error) {
+func (b *DefaultSegmentBuilder) BuildDTM(ctx context.Context, date time.Time, qualifier string) (EDISegment, error) {
+	select {
+	case <-ctx.Done():
+		return EDISegment{}, ErrContextCancelled
+	default:
+	}
+	
 	formattedDate := date.Format(DateFormatCCYYMMDD)
 	return EDISegment{
 		Tag: SegmentTagDTM,
@@ -575,7 +791,13 @@ func (b *DefaultSegmentBuilder) BuildDTM(date time.Time, qualifier string) (EDIS
 	}, nil
 }
 
-func (b *DefaultSegmentBuilder) BuildCUX(order EDIOrder) (EDISegment, error) {
+func (b *DefaultSegmentBuilder) BuildCUX(ctx context.Context, order EDIOrder) (EDISegment, error) {
+	select {
+	case <-ctx.Done():
+		return EDISegment{}, ErrContextCancelled
+	default:
+	}
+	
 	qualifier := CurrencyReference
 	if order.CurrencyQualifier != "" {
 		qualifier = order.CurrencyQualifier
@@ -589,7 +811,13 @@ func (b *DefaultSegmentBuilder) BuildCUX(order EDIOrder) (EDISegment, error) {
 	}, nil
 }
 
-func (b *DefaultSegmentBuilder) BuildNAD(partyQualifier string, address Address) (EDISegment, error) {
+func (b *DefaultSegmentBuilder) BuildNAD(ctx context.Context, partyQualifier string, address Address) (EDISegment, error) {
+	select {
+	case <-ctx.Done():
+		return EDISegment{}, ErrContextCancelled
+	default:
+	}
+	
 	elements := []string{partyQualifier}
 	
 	idType := IDTypeBuyer
@@ -609,7 +837,13 @@ func (b *DefaultSegmentBuilder) BuildNAD(partyQualifier string, address Address)
 	return EDISegment{Tag: SegmentTagNAD, Elements: elements}, nil
 }
 
-func (b *DefaultSegmentBuilder) BuildTOD(order EDIOrder) (EDISegment, error) {
+func (b *DefaultSegmentBuilder) BuildTOD(ctx context.Context, order EDIOrder) (EDISegment, error) {
+	select {
+	case <-ctx.Done():
+		return EDISegment{}, ErrContextCancelled
+	default:
+	}
+	
 	elements := []string{"3", ""}
 	
 	if order.DeliveryTermsCode != "" {
@@ -621,7 +855,13 @@ func (b *DefaultSegmentBuilder) BuildTOD(order EDIOrder) (EDISegment, error) {
 	return EDISegment{Tag: SegmentTagTOD, Elements: elements}, nil
 }
 
-func (b *DefaultSegmentBuilder) BuildPAT(order EDIOrder) (EDISegment, error) {
+func (b *DefaultSegmentBuilder) BuildPAT(ctx context.Context, order EDIOrder) (EDISegment, error) {
+	select {
+	case <-ctx.Done():
+		return EDISegment{}, ErrContextCancelled
+	default:
+	}
+	
 	elements := []string{"1", ""}
 	
 	if order.PaymentTermsCode != "" {
@@ -633,7 +873,13 @@ func (b *DefaultSegmentBuilder) BuildPAT(order EDIOrder) (EDISegment, error) {
 	return EDISegment{Tag: SegmentTagPAT, Elements: elements}, nil
 }
 
-func (b *DefaultSegmentBuilder) BuildTDT(order EDIOrder) (EDISegment, error) {
+func (b *DefaultSegmentBuilder) BuildTDT(ctx context.Context, order EDIOrder) (EDISegment, error) {
+	select {
+	case <-ctx.Done():
+		return EDISegment{}, ErrContextCancelled
+	default:
+	}
+	
 	elements := []string{"20", "1", ""}
 	
 	if order.TransportModeCode != "" {
@@ -645,7 +891,13 @@ func (b *DefaultSegmentBuilder) BuildTDT(order EDIOrder) (EDISegment, error) {
 	return EDISegment{Tag: SegmentTagTDT, Elements: elements}, nil
 }
 
-func (b *DefaultSegmentBuilder) BuildLIN(item EDIOrderItem) (EDISegment, error) {
+func (b *DefaultSegmentBuilder) BuildLIN(ctx context.Context, item EDIOrderItem) (EDISegment, error) {
+	select {
+	case <-ctx.Done():
+		return EDISegment{}, ErrContextCancelled
+	default:
+	}
+	
 	elements := []string{
 		strconv.Itoa(item.LineNumber),
 		"",
@@ -662,7 +914,13 @@ func (b *DefaultSegmentBuilder) BuildLIN(item EDIOrderItem) (EDISegment, error) 
 	return EDISegment{Tag: SegmentTagLIN, Elements: elements}, nil
 }
 
-func (b *DefaultSegmentBuilder) BuildIMD(item EDIOrderItem) (EDISegment, error) {
+func (b *DefaultSegmentBuilder) BuildIMD(ctx context.Context, item EDIOrderItem) (EDISegment, error) {
+	select {
+	case <-ctx.Done():
+		return EDISegment{}, ErrContextCancelled
+	default:
+	}
+	
 	return EDISegment{
 		Tag: SegmentTagIMD,
 		Elements: []string{
@@ -674,13 +932,19 @@ func (b *DefaultSegmentBuilder) BuildIMD(item EDIOrderItem) (EDISegment, error) 
 	}, nil
 }
 
-func (b *DefaultSegmentBuilder) BuildQTY(item EDIOrderItem) (EDISegment, error) {
+func (b *DefaultSegmentBuilder) BuildQTY(ctx context.Context, item EDIOrderItem) (EDISegment, error) {
+	select {
+	case <-ctx.Done():
+		return EDISegment{}, ErrContextCancelled
+	default:
+	}
+	
 	uom := item.UnitOfMeasure
 	if uom == "" {
 		uom = "PCE"
 	}
 	
-	quantityStr := strconv.FormatFloat(item.Quantity, 'f', -1, 64)
+	quantityStr := strconv.FormatFloat(item.Quantity, 'f', 2, 64)
 	
 	return EDISegment{
 		Tag: SegmentTagQTY,
@@ -690,8 +954,14 @@ func (b *DefaultSegmentBuilder) BuildQTY(item EDIOrderItem) (EDISegment, error) 
 	}, nil
 }
 
-func (b *DefaultSegmentBuilder) BuildPRI(item EDIOrderItem) (EDISegment, error) {
-	priceStr := strconv.FormatFloat(item.UnitPrice, 'f', -1, 64)
+func (b *DefaultSegmentBuilder) BuildPRI(ctx context.Context, item EDIOrderItem) (EDISegment, error) {
+	select {
+	case <-ctx.Done():
+		return EDISegment{}, ErrContextCancelled
+	default:
+	}
+	
+	priceStr := strconv.FormatFloat(item.UnitPrice, 'f', 2, 64)
 	
 	return EDISegment{
 		Tag: SegmentTagPRI,
@@ -701,8 +971,14 @@ func (b *DefaultSegmentBuilder) BuildPRI(item EDIOrderItem) (EDISegment, error) 
 	}, nil
 }
 
-func (b *DefaultSegmentBuilder) BuildMOA(item EDIOrderItem) (EDISegment, error) {
-	amountStr := strconv.FormatFloat(item.Amount, 'f', -1, 64)
+func (b *DefaultSegmentBuilder) BuildMOA(ctx context.Context, item EDIOrderItem) (EDISegment, error) {
+	select {
+	case <-ctx.Done():
+		return EDISegment{}, ErrContextCancelled
+	default:
+	}
+	
+	amountStr := strconv.FormatFloat(item.Amount, 'f', 2, 64)
 	
 	return EDISegment{
 		Tag: SegmentTagMOA,
@@ -712,7 +988,13 @@ func (b *DefaultSegmentBuilder) BuildMOA(item EDIOrderItem) (EDISegment, error) 
 	}, nil
 }
 
-func (b *DefaultSegmentBuilder) BuildCNT(order EDIOrder) (EDISegment, error) {
+func (b *DefaultSegmentBuilder) BuildCNT(ctx context.Context, order EDIOrder) (EDISegment, error) {
+	select {
+	case <-ctx.Done():
+		return EDISegment{}, ErrContextCancelled
+	default:
+	}
+	
 	return EDISegment{
 		Tag: SegmentTagCNT,
 		Elements: []string{
@@ -721,8 +1003,14 @@ func (b *DefaultSegmentBuilder) BuildCNT(order EDIOrder) (EDISegment, error) {
 	}, nil
 }
 
-func (b *DefaultSegmentBuilder) BuildMOATotal(order EDIOrder) (EDISegment, error) {
-	amountStr := strconv.FormatFloat(order.TotalAmount, 'f', -1, 64)
+func (b *DefaultSegmentBuilder) BuildMOATotal(ctx context.Context, order EDIOrder) (EDISegment, error) {
+	select {
+	case <-ctx.Done():
+		return EDISegment{}, ErrContextCancelled
+	default:
+	}
+	
+	amountStr := strconv.FormatFloat(order.TotalAmount, 'f', 2, 64)
 	
 	return EDISegment{
 		Tag: SegmentTagMOA,
@@ -732,7 +1020,13 @@ func (b *DefaultSegmentBuilder) BuildMOATotal(order EDIOrder) (EDISegment, error
 	}, nil
 }
 
-func (b *DefaultSegmentBuilder) BuildUNT(order EDIOrder, segmentCount int) (EDISegment, error) {
+func (b *DefaultSegmentBuilder) BuildUNT(ctx context.Context, order EDIOrder, segmentCount int) (EDISegment, error) {
+	select {
+	case <-ctx.Done():
+		return EDISegment{}, ErrContextCancelled
+	default:
+	}
+	
 	return EDISegment{
 		Tag: SegmentTagUNT,
 		Elements: []string{
@@ -742,7 +1036,13 @@ func (b *DefaultSegmentBuilder) BuildUNT(order EDIOrder, segmentCount int) (EDIS
 	}, nil
 }
 
-func (b *DefaultSegmentBuilder) BuildUNZ(order EDIOrder, messageCount int) (EDISegment, error) {
+func (b *DefaultSegmentBuilder) BuildUNZ(ctx context.Context, order EDIOrder, messageCount int) (EDISegment, error) {
+	select {
+	case <-ctx.Done():
+		return EDISegment{}, ErrContextCancelled
+	default:
+	}
+	
 	return EDISegment{
 		Tag: SegmentTagUNZ,
 		Elements: []string{
@@ -768,72 +1068,73 @@ func (w *EDIWriter) WriteOrder(ctx context.Context, order EDIOrder, content stri
 	default:
 	}
 	
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	
 	if err := os.MkdirAll(w.outputDir, DirPerms); err != nil {
 		return "", fmt.Errorf("%w: failed to create directory: %v", ErrFileWrite, err)
 	}
 	
 	timestamp := time.Now().Format("20060102_150405")
-	safeOrderNumber := strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
-			return r
-		}
-		return '_'
-	}, order.OrderNumber)
+	safeOrderNumber := sanitizeFilename(order.OrderNumber)
 	
 	filename := filepath.Join(w.outputDir, fmt.Sprintf("ORDER_%s_%s.edi", safeOrderNumber, timestamp))
 	
-	if !strings.HasPrefix(filepath.Clean(filename), filepath.Clean(w.outputDir)) {
+	if !isPathSafe(w.outputDir, filename) {
 		return "", fmt.Errorf("%w: path traversal detected", ErrFileWrite)
 	}
-	
-	if err := os.WriteFile(filename, []byte(content), FilePerms); err != nil {
-		return "", fmt.Errorf("%w: failed to write file: %v", ErrFileWrite, err)
-	}
-	
-	return filename, nil
-}
-
-func (w *EDIWriter) WriteOrderWithPrefix(ctx context.Context, order EDIOrder, content string, prefix string) (string, error) {
-	safePrefix := strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
-			return r
-		}
-		return '_'
-	}, prefix)
 	
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	
-	if err := os.MkdirAll(w.outputDir, DirPerms); err != nil {
-		return "", fmt.Errorf("%w: failed to create directory: %v", ErrFileWrite, err)
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	default:
 	}
 	
-	timestamp := time.Now().Format("20060102_150405")
-	safeOrderNumber := strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
-			return r
-		}
-		return '_'
-	}, order.OrderNumber)
+	file, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, FilePerms)
+	if err != nil {
+		return "", fmt.Errorf("%w: failed to create file: %v", ErrFileWrite, err)
+	}
+	defer file.Close()
 	
-	filename := filepath.Join(w.outputDir, fmt.Sprintf("%s_%s_%s.edi", safePrefix, safeOrderNumber, timestamp))
-	
-	if !strings.HasPrefix(filepath.Clean(filename), filepath.Clean(w.outputDir)) {
-		return "", fmt.Errorf("%w: path traversal detected", ErrFileWrite)
+	_, err = file.WriteString(content)
+	if err != nil {
+		return "", fmt.Errorf("%w: failed to write content: %v", ErrFileWrite, err)
 	}
 	
-	if err := os.WriteFile(filename, []byte(content), FilePerms); err != nil {
-		return "", fmt.Errorf("%w: failed to write file: %v", ErrFileWrite, err)
+	if err := file.Sync(); err != nil {
+		return "", fmt.Errorf("%w: failed to sync file: %v", ErrFileWrite, err)
 	}
 	
 	return filename, nil
 }
 
+func sanitizeFilename(name string) string {
+	var result strings.Builder
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			result.WriteRune(r)
+		} else {
+			result.WriteRune('_')
+		}
+	}
+	return result.String()
+}
+
+func isPathSafe(base, path string) bool {
+	cleanBase := filepath.Clean(base)
+	cleanPath := filepath.Clean(path)
+	return strings.HasPrefix(cleanPath, cleanBase+string(os.PathSeparator)) || cleanPath == cleanBase
+}
+
 func main() {
-	generator := NewEDIFACTOrderGenerator()
+	ctx := context.Background()
+	
+	generator, err := NewEDIFACTOrderGenerator()
+	if err != nil {
+		fmt.Printf("Error creating generator: %v\n", err)
+		return
+	}
+	
 	writer := NewEDIWriter("./edi_output")
 	
 	order := EDIOrder{
@@ -907,13 +1208,15 @@ func main() {
 		SyntaxVersion:     "2",
 	}
 	
-	ctx := context.Background()
+	var buffer strings.Builder
 	
-	ediMessage, err := generator.Generate(order)
+	err = generator.Generate(ctx, order, &buffer)
 	if err != nil {
 		fmt.Printf("Error generating EDIFACT message: %v\n", err)
 		return
 	}
+	
+	ediMessage := buffer.String()
 	
 	filename, err := writer.WriteOrder(ctx, order, ediMessage)
 	if err != nil {
